@@ -2,6 +2,7 @@
 #define APP_HPP
 
 #include <chrono>
+#include <vector>
 #include "nn/nn-core.hpp"
 #include "nn/nn-cpu.hpp"
 #include "tokenizer.hpp"
@@ -35,6 +36,10 @@ public:
     int gpuSegmentFrom;
     int gpuSegmentTo;
 
+    // proxy
+    const char *proxyHost;
+    NnUint proxyPort;
+
     // binding
     const char *host;
     NnUint port;
@@ -58,9 +63,11 @@ private:
     NnNetExecution *execution;
     NnExecutor *executor;
     NnNetwork *network;
+    NnProxyNetwork *proxyNetwork;
     LlmControlPacket controlPacket;
+    std::vector<NnSize> nodeMatmulOpsPerToken;
 public:
-    RootLlmInference(LlmNet *net, NnNetExecution *execution, NnExecutor *executor, NnNetwork *network);
+    RootLlmInference(LlmNet *net, NnNetExecution *execution, NnExecutor *executor, NnNetwork *network, NnProxyNetwork *proxyNetwork, std::vector<NnSize> nodeMatmulOpsPerToken);
     void setBatchSize(NnUint batchSize);
     void setPosition(NnUint position);
     void setToken(NnUint batchIndex, NnUint token);
@@ -93,5 +100,6 @@ typedef struct {
 
 void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *context));
 void runWorkerApp(AppCliArgs *args);
+void runProxyApp(AppCliArgs *args);
 
 #endif

@@ -273,6 +273,8 @@ int main(int argc, char **argv) {
             runInferenceApp(&args, &chat);
         else if (std::strcmp(args.mode, "worker") == 0)
             runWorkerApp(&args);
+        else if (std::strcmp(args.mode, "proxy") == 0)
+            runProxyApp(&args);
         else
             throw std::runtime_error("Unsupported mode");
     } catch (const std::exception &e) {

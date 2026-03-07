@@ -57,6 +57,7 @@ public:
     ~NnNetwork();
 
     void setTurbo(bool enabled);
+    int getSocket(NnUint socketIndex) const;
     void write(const NnUint socketIndex, const void *data, const NnSize size);
     void read(const NnUint socketIndex, void *data, const NnSize size);
     void writeAck(const NnUint socketIndex);
@@ -67,6 +68,78 @@ public:
     void readMany(NnUint n, NnSocketIo *ios);
     void getStats(NnSize *sentBytes, NnSize *recvBytes);
     void resetStats();
+};
+
+// A root-side network that communicates exclusively with a proxy node.
+// The proxy aggregates all worker sync traffic, so from the root's perspective
+// there is exactly one socket (to the proxy), but the proxy handles fanning
+// out to all real workers. The interface is the same as NnNetwork so the rest
+// of the inference stack needs no changes.
+class NnProxyNetwork {
+private:
+    int proxyFd;
+    NnSize _sentBytes;
+    NnSize _recvBytes;
+public:
+    NnUint nNodes; // total logical nodes (root + nWorkers), set by proxy handshake
+
+    static std::unique_ptr<NnProxyNetwork> connect(const char *proxyHost, NnUint proxyPort);
+
+    NnProxyNetwork(int proxyFd, NnUint nNodes);
+    ~NnProxyNetwork();
+
+    void setTurbo(bool enabled);
+    void write(const void *data, NnSize size);
+    void read(void *data, NnSize size);
+    void writeAll(void *data, NnSize size); // broadcasts to proxy (which fans out to workers)
+    bool tryReadWithMaxAttempts(void *data, NnSize size, unsigned long maxAttempts);
+    void getStats(NnSize *sentBytes, NnSize *recvBytes);
+    void resetStats();
+    int getSocket() const;
+};
+
+// Synchronizer that uses NnProxyNetwork for root↔proxy communication.
+class NnProxyNodeSynchronizer : public NnNodeSynchronizer {
+private:
+    NnProxyNetwork *network;
+    NnNetExecution *execution;
+    NnNetConfig *netConfig;
+    NnNodeConfig *nodeConfig;
+public:
+    NnProxyNodeSynchronizer(NnProxyNetwork *network, NnNetExecution *execution, NnNetConfig *netConfig, NnNodeConfig *nodeConfig);
+    ~NnProxyNodeSynchronizer() override {};
+    void sync(NnUint segmentIndex, NnUint nThreads, NnUint threadIndex) override;
+};
+
+// Config writer that sends config to proxy (which forwards to each worker).
+class NnProxyConfigWriter {
+private:
+    NnProxyNetwork *network;
+public:
+    NnProxyConfigWriter(NnProxyNetwork *network);
+    void writeNet(NnNetConfig *config);
+    void writeNode(NnNodeConfig *config);
+    void writeToWorkers(NnNetConfig *netConfig, NnNodeConfig *nodeConfigs);
+};
+
+// Weight loader that sends weight slices to proxy (which forwards to workers).
+class NnProxyWeightLoader {
+private:
+    NnExecutor *executor;
+    NnProxyNetwork *network;
+    NnUint nNodes;
+    NnByte *temp;
+    NnSize tempSize;
+    void allocate(NnSize size);
+    void writeWeight(const char *opName, NnUint opIndex, NnSize offset, NnSize nBytes, NnByte *weight);
+public:
+    NnProxyWeightLoader(NnExecutor *executor, NnProxyNetwork *network, NnUint nNodes);
+    ~NnProxyWeightLoader();
+    NnSize loadRoot(const char *opName, NnUint opIndex, NnSize nBytes, NnByte *weight);
+    NnSize loadAll(const char *opName, NnUint opIndex, NnSize nBytes, NnByte *weight);
+    NnSize loadRowMatmulSlices(const char *opName, NnUint opIndex, NnUint expertIndex, NnRowMatmulSlice *slice, NnByte *weight);
+    NnSize loadColMatmulSlices(const char *opName, NnUint opIndex, NnUint expertIndex, NnColMatmulSlice *slice, NnByte *weight);
+    void finish();
 };
 
 class NnNetworkNodeSynchronizer : public NnNodeSynchronizer {

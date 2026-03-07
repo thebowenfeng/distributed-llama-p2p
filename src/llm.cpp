@@ -611,7 +611,8 @@ void releaseLlmNet(LlmNet *net) {
     delete[] net->nodeConfigs;
 }
 
-void loadLlmNetWeight(const char *path, LlmNet *net, NnRootWeightLoader *loader) {
+template<typename T>
+static void loadLlmNetWeightImpl(const char *path, LlmNet *net, T *loader) {
     MmapFile file;
     openMmapFile(&file, path, net->header->fileSize);
 #if DEBUG_USE_MMAP_FOR_WEIGHTS
@@ -666,4 +667,12 @@ void loadLlmNetWeight(const char *path, LlmNet *net, NnRootWeightLoader *loader)
     printf("💿 Weights loaded\n");
 
     loader->finish();
+}
+
+void loadLlmNetWeight(const char *path, LlmNet *net, NnRootWeightLoader *loader) {
+    loadLlmNetWeightImpl(path, net, loader);
+}
+
+void loadLlmNetWeight(const char *path, LlmNet *net, NnProxyWeightLoader *loader) {
+    loadLlmNetWeightImpl(path, net, loader);
 }

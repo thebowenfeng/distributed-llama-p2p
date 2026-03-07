@@ -396,6 +396,11 @@ NnNetwork::~NnNetwork() {
     printf("⭕ Network is closed\n");
 }
 
+int NnNetwork::getSocket(NnUint socketIndex) const {
+    assert(socketIndex < nSockets);
+    return sockets[socketIndex];
+}
+
 void NnNetwork::setTurbo(bool enabled) {
     for (NnUint i = 0; i < nSockets; i++) {
         ::setNonBlocking(sockets[i], enabled);
@@ -628,6 +633,302 @@ void NnNetworkNodeSynchronizer::sync(NnUint segmentIndex, NnUint nThreads, NnUin
                 throw std::invalid_argument("Unknown sync type");
             }
         }
+    }
+}
+
+// ============================================================================
+// NnProxyNetwork
+// ============================================================================
+
+std::unique_ptr<NnProxyNetwork> NnProxyNetwork::connect(const char *proxyHost, NnUint proxyPort) {
+    printf("⭕ Connecting to proxy at %s:%u...\n", proxyHost, proxyPort);
+    int fd = connectSocket((char *)proxyHost, (int)proxyPort);
+    // Proxy sends us nNodes (total logical nodes incl. root) after connection
+    NnUint nNodes;
+    readSocket(fd, &nNodes, sizeof(nNodes));
+    writeAckPacket(fd);
+    printf("⭕ Connected to proxy, nNodes=%u\n", nNodes);
+    return std::unique_ptr<NnProxyNetwork>(new NnProxyNetwork(fd, nNodes));
+}
+
+NnProxyNetwork::NnProxyNetwork(int proxyFd, NnUint nNodes) {
+    this->proxyFd = proxyFd;
+    this->nNodes = nNodes;
+    this->_sentBytes = 0;
+    this->_recvBytes = 0;
+}
+
+NnProxyNetwork::~NnProxyNetwork() {
+    destroySocket(proxyFd);
+    printf("⭕ Proxy connection closed\n");
+}
+
+void NnProxyNetwork::setTurbo(bool enabled) {
+    setNonBlocking(proxyFd, enabled);
+}
+
+void NnProxyNetwork::write(const void *data, NnSize size) {
+    writeSocket(proxyFd, data, size);
+    _sentBytes += size;
+}
+
+void NnProxyNetwork::read(void *data, NnSize size) {
+    readSocket(proxyFd, data, size);
+    _recvBytes += size;
+}
+
+void NnProxyNetwork::writeAll(void *data, NnSize size) {
+    // Proxy fans out to all workers — root just sends once to proxy
+    writeSocket(proxyFd, data, size);
+    _sentBytes += size;
+}
+
+bool NnProxyNetwork::tryReadWithMaxAttempts(void *data, NnSize size, unsigned long maxAttempts) {
+    if (tryReadSocket(proxyFd, data, size, maxAttempts)) {
+        _recvBytes += size;
+        return true;
+    }
+    return false;
+}
+
+void NnProxyNetwork::getStats(NnSize *sentBytes, NnSize *recvBytes) {
+    *sentBytes = _sentBytes;
+    *recvBytes = _recvBytes;
+    resetStats();
+}
+
+void NnProxyNetwork::resetStats() {
+    _sentBytes = 0;
+    _recvBytes = 0;
+}
+
+int NnProxyNetwork::getSocket() const {
+    return proxyFd;
+}
+
+// ============================================================================
+// NnProxyNodeSynchronizer
+// ============================================================================
+
+NnProxyNodeSynchronizer::NnProxyNodeSynchronizer(NnProxyNetwork *network, NnNetExecution *execution, NnNetConfig *netConfig, NnNodeConfig *nodeConfig) {
+    this->network = network;
+    this->execution = execution;
+    this->netConfig = netConfig;
+    this->nodeConfig = nodeConfig;
+}
+
+void NnProxyNodeSynchronizer::sync(NnUint segmentIndex, NnUint nThreads, NnUint threadIndex) {
+    if (threadIndex != 0) return; // Only one thread communicates with proxy
+
+    NnSegmentConfig *segmentConfig = &nodeConfig->segments[segmentIndex];
+    for (NnUint syncIndex = 0; syncIndex < segmentConfig->nSyncs; syncIndex++) {
+        NnSyncConfig *syncConfig = &segmentConfig->syncs[syncIndex];
+        NnByte *pipe = execution->pipes[syncConfig->pipeIndex];
+        NnPipeConfig *pipeConfig = &netConfig->pipes[syncConfig->pipeIndex];
+        NnSize batchBytes = getBytes(pipeConfig->size.floatType, pipeConfig->size.x);
+
+        for (NnUint batchIndex = 0; batchIndex < execution->batchSize; batchIndex++) {
+            NnByte *pipeBatch = &pipe[batchIndex * batchBytes];
+
+            if (syncConfig->syncType == SYNC_WITH_ROOT) {
+                // Root sends its slice to proxy; proxy broadcasts to workers.
+                // Root then receives nothing (workers get it from proxy).
+                network->write(pipeBatch, batchBytes);
+            } else if (syncConfig->syncType == SYNC_NODE_SLICES) {
+                // Root sends its slice, then receives all worker slices from proxy.
+                NnSize sliceBytes = batchBytes / network->nNodes;
+                NnByte *mySlice = &pipeBatch[0]; // root is node 0
+                network->write(mySlice, sliceBytes);
+                // Receive all other slices from proxy (proxy aggregated them)
+                for (NnUint n = 1; n < network->nNodes; n++) {
+                    NnByte *sliceData = &pipeBatch[n * sliceBytes];
+                    network->read(sliceData, sliceBytes);
+                }
+            } else if (syncConfig->syncType == SYNC_NODE_SLICES_EXCEPT_ROOT) {
+                // Root only receives worker slices (doesn't send its own).
+                NnSize sliceBytes = batchBytes / network->nNodes;
+                for (NnUint n = 1; n < network->nNodes; n++) {
+                    NnByte *sliceData = &pipeBatch[n * sliceBytes];
+                    network->read(sliceData, sliceBytes);
+                }
+            } else {
+                throw std::invalid_argument("Unknown sync type");
+            }
+        }
+    }
+}
+
+// ============================================================================
+// NnProxyConfigWriter
+// ============================================================================
+
+NnProxyConfigWriter::NnProxyConfigWriter(NnProxyNetwork *network) {
+    this->network = network;
+}
+
+static void proxyWriteString(NnProxyNetwork *network, char *str) {
+    NnUint bytes = std::strlen(str) + 1;
+    network->write(&bytes, sizeof(NnUint));
+    network->write(str, bytes);
+}
+
+void NnProxyConfigWriter::writeNet(NnNetConfig *config) {
+    NnUint ack = ACK;
+    network->write(&ack, sizeof(ack));
+    network->write(&config->nBatches, sizeof(config->nBatches));
+    network->write(&config->nNodes, sizeof(config->nNodes));
+    network->write(&config->nPipes, sizeof(config->nPipes));
+    for (NnUint pipeIndex = 0; pipeIndex < config->nPipes; pipeIndex++) {
+        NnPipeConfig *pipeConfig = &config->pipes[pipeIndex];
+        network->write(&pipeConfig->size, sizeof(pipeConfig->size));
+        proxyWriteString(network, pipeConfig->name);
+    }
+    network->write(&config->nPreSyncs, sizeof(config->nPreSyncs));
+    for (NnUint preSyncIndex = 0; preSyncIndex < config->nPreSyncs; preSyncIndex++) {
+        NnPreSyncConfig *preSyncConfig = &config->preSyncs[preSyncIndex];
+        network->write(&preSyncConfig->pipeIndex, sizeof(preSyncConfig->pipeIndex));
+    }
+    // Read ack from proxy (proxy collected acks from all workers)
+    NnUint rack; network->read(&rack, sizeof(rack));
+}
+
+void NnProxyConfigWriter::writeNode(NnNodeConfig *config) {
+    NnUint ack = ACK;
+    network->write(&ack, sizeof(ack));
+    network->write(&config->nodeIndex, sizeof(config->nodeIndex));
+    network->write(&config->nBuffers, sizeof(config->nBuffers));
+    network->write(&config->nSegments, sizeof(config->nSegments));
+    for (NnUint bufferIndex = 0; bufferIndex < config->nBuffers; bufferIndex++) {
+        NnBufferConfig *bufferConfig = &config->buffers[bufferIndex];
+        network->write(&bufferConfig->size, sizeof(bufferConfig->size));
+        proxyWriteString(network, bufferConfig->name);
+    }
+    for (NnUint segmentIndex = 0; segmentIndex < config->nSegments; segmentIndex++) {
+        NnSegmentConfig *segmentConfig = &config->segments[segmentIndex];
+        network->write(&segmentConfig->nSyncs, sizeof(segmentConfig->nSyncs));
+        network->write(&segmentConfig->nOps, sizeof(segmentConfig->nOps));
+        for (NnUint syncIndex = 0; syncIndex < segmentConfig->nSyncs; syncIndex++) {
+            NnSyncConfig *syncConfig = &segmentConfig->syncs[syncIndex];
+            network->write(&syncConfig->pipeIndex, sizeof(syncConfig->pipeIndex));
+            network->write(&syncConfig->syncType, sizeof(syncConfig->syncType));
+        }
+        for (NnUint opIndex = 0; opIndex < segmentConfig->nOps; opIndex++) {
+            NnOpConfig *opConfig = &segmentConfig->ops[opIndex];
+            network->write(&opConfig->code, sizeof(opConfig->code));
+            network->write(&opConfig->index, sizeof(opConfig->index));
+            network->write(&opConfig->weightSize, sizeof(opConfig->weightSize));
+            network->write(&opConfig->configSize, sizeof(opConfig->configSize));
+            proxyWriteString(network, opConfig->name);
+            network->write(&opConfig->input, sizeof(opConfig->input));
+            network->write(&opConfig->output, sizeof(opConfig->output));
+            if (opConfig->configSize > 0)
+                network->write(opConfig->config, opConfig->configSize);
+        }
+    }
+    NnUint rack; network->read(&rack, sizeof(rack));
+}
+
+void NnProxyConfigWriter::writeToWorkers(NnNetConfig *netConfig, NnNodeConfig *nodeConfigs) {
+    for (NnUint nodeIndex = 1; nodeIndex < netConfig->nNodes; nodeIndex++) {
+        writeNet(netConfig);
+        writeNode(&nodeConfigs[nodeIndex]);
+    }
+}
+
+// ============================================================================
+// NnProxyWeightLoader
+// ============================================================================
+
+NnProxyWeightLoader::NnProxyWeightLoader(NnExecutor *executor, NnProxyNetwork *network, NnUint nNodes) {
+    this->executor = executor;
+    this->network = network;
+    this->nNodes = nNodes;
+    this->temp = nullptr;
+    this->tempSize = 0;
+}
+
+NnProxyWeightLoader::~NnProxyWeightLoader() {
+    if (tempSize > 0)
+        delete[] temp;
+}
+
+void NnProxyWeightLoader::allocate(NnSize size) {
+    if (tempSize < size) {
+        if (tempSize > 0)
+            delete[] temp;
+        tempSize = size;
+        temp = new NnByte[size];
+    }
+}
+
+void NnProxyWeightLoader::writeWeight(const char *opName, NnUint opIndex, NnSize offset, NnSize nBytes, NnByte *weight) {
+    NnUint nameSize = std::strlen(opName) + 1;
+    network->write(&nameSize, sizeof(nameSize));
+    network->write(opName, nameSize);
+    network->write(&opIndex, sizeof(opIndex));
+    network->write(&offset, sizeof(offset));
+    network->write(&nBytes, sizeof(nBytes));
+    network->write(weight, nBytes);
+}
+
+NnSize NnProxyWeightLoader::loadRoot(const char *opName, NnUint opIndex, NnSize nBytes, NnByte *weight) {
+    executor->loadWeight(opName, opIndex, 0u, nBytes, weight);
+    return nBytes;
+}
+
+NnSize NnProxyWeightLoader::loadAll(const char *opName, NnUint opIndex, NnSize nBytes, NnByte *weight) {
+    executor->loadWeight(opName, opIndex, 0u, nBytes, weight);
+    if (nNodes > 1u) {
+        for (NnUint nodeIndex = 1u; nodeIndex < nNodes; nodeIndex++)
+            writeWeight(opName, opIndex, 0u, nBytes, weight);
+    }
+    return nBytes;
+}
+
+NnSize NnProxyWeightLoader::loadRowMatmulSlices(const char *opName, NnUint opIndex, NnUint expertIndex, NnRowMatmulSlice *slice, NnByte *weight) {
+    const NnUint offset = expertIndex * slice->sliceSize.nBytes;
+    if (nNodes == 1u) {
+        executor->loadWeight(opName, opIndex, offset, slice->sliceSize.nBytes, weight);
+    } else {
+        allocate(slice->sliceSize.nBytes);
+        for (NnUint nodeIndex = 0; nodeIndex < nNodes; nodeIndex++) {
+            splitRowMatmulWeight(slice, nodeIndex, weight, temp);
+            if (nodeIndex == 0u)
+                executor->loadWeight(opName, opIndex, offset, slice->sliceSize.nBytes, temp);
+            else
+                writeWeight(opName, opIndex, offset, slice->sliceSize.nBytes, temp);
+        }
+    }
+    return slice->size.nBytes;
+}
+
+NnSize NnProxyWeightLoader::loadColMatmulSlices(const char *opName, NnUint opIndex, NnUint expertIndex, NnColMatmulSlice *slice, NnByte *weight) {
+    const NnUint offset = expertIndex * slice->sliceSize.nBytes;
+    if (nNodes == 1u) {
+        executor->loadWeight(opName, opIndex, offset, slice->sliceSize.nBytes, weight);
+    } else {
+        allocate(slice->sliceSize.nBytes);
+        for (NnUint nodeIndex = 0; nodeIndex < nNodes; nodeIndex++) {
+            splitColMatmulWeight(slice, nodeIndex, weight, temp);
+            if (nodeIndex == 0u)
+                executor->loadWeight(opName, opIndex, offset, slice->sliceSize.nBytes, temp);
+            else
+                writeWeight(opName, opIndex, offset, slice->sliceSize.nBytes, temp);
+        }
+    }
+    return slice->size.nBytes;
+}
+
+void NnProxyWeightLoader::finish() {
+    NnUint zeroSize = 0;
+    for (NnUint nodeIndex = 1u; nodeIndex < nNodes; nodeIndex++) {
+        network->write(&zeroSize, sizeof(zeroSize));
+        // Read ack from proxy (proxy collected acks from workers)
+        NnUint ack; network->read(&ack, sizeof(ack));
+    }
+    if (tempSize > 0) {
+        delete[] temp;
+        tempSize = 0;
     }
 }
 

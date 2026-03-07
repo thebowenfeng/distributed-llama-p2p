@@ -182,6 +182,28 @@ typedef struct {
     NnPreSyncConfig *preSyncs;
 } NnNetConfig;
 
+/**
+* NnNodeConfig
+├── nodeIndex = 0 (root) or 1,2,... (workers)
+├── buffers[]
+│   ├── "x"   [nBatches × dim]          ← residual stream, persists across all layer segments
+│   ├── "y"   [nBatches × dim]          ← scratch: norm output, reused each layer
+│   ├── "q"   [nBatches × qSlice.d0]   ← query vectors for this node's heads
+│   ├── "k"   [seqLen × kvDim0]         ← KV cache K, one per layer (grows with context)
+│   ├── "v"   [seqLen × kvDim0]         ← KV cache V, one per layer
+│   ├── "d"   [nBatches × w1Slice.d0]  ← FFN gate/content intermediate
+│   ├── "lg"  [nBatches × vocabSize/nNodes] ← logit slice
+│   └── ...   (rope cache, att scores, quantised intermediates)
+└── segments[]
+    ├── [0] START: embedding (root) → SYNC_WITH_ROOT(X)
+    ├── [1] ATT layer 0: merge/cast → norm → Q/K/V matmul → rope → KV cache write → attention → wo matmul →
+SYNC_NODE_SLICES(ZQ)
+    ├── [2] FF  layer 0: merge_add → norm → w1/w3 matmul → silu → mul → w2 matmul → SYNC_NODE_SLICES(ZQ)
+    ├── [3] ATT layer 1: ...
+    ├── [4] FF  layer 1: ...
+    ...
+    └── [2+2*nLayers] END: merge_add → final norm → wcls matmul → SYNC_NODE_SLICES_EXCEPT_ROOT(LG)
+ */
 typedef struct {
     NnUint nodeIndex;
     NnUint nBuffers;
