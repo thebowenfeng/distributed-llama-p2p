@@ -50,8 +50,10 @@ private:
 public:
     static std::unique_ptr<NnNetwork> serve(const char *host, const int port);
     static std::unique_ptr<NnNetwork> connect(NnUint nSockets, char **hosts, NnUint *ports);
+    static std::unique_ptr<NnNetwork> connectIsolated(NnUint nSockets, char **hosts, NnUint *ports, NnUint totalNodes);
 
     NnUint nSockets;
+    NnUint nNodes; // logical node count (may differ from nSockets in proxy mode)
 
     NnNetwork(std::vector<NnSocket> *sockets);
     ~NnNetwork();

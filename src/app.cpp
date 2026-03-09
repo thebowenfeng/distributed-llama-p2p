@@ -404,8 +404,8 @@ void runProxyApp(AppCliArgs *args) {
     // -------------------------------------------------------------------------
     // Stage 1: Connect to all workers first, then accept root connection
     // -------------------------------------------------------------------------
-    printf("\n📡 [Stage 1] Connecting to %u worker(s)...\n", args->nWorkers);
-    std::unique_ptr<NnNetwork> workerNetwork(NnNetwork::connect(args->nWorkers, args->workerHosts, args->workerPorts).release());
+    printf("\n📡 [Stage 1] Connecting to %u worker(s) in isolated mode...\n", args->nWorkers);
+    std::unique_ptr<NnNetwork> workerNetwork(NnNetwork::connectIsolated(args->nWorkers, args->workerHosts, args->workerPorts, nNodes).release());
     printf("✅ [Stage 1] All %u worker(s) connected\n\n", args->nWorkers);
 
     printf("✅ [Stage 1] Handshake complete: proxy <-> %u worker(s)\n\n", args->nWorkers);
@@ -574,29 +574,51 @@ void runProxyApp(AppCliArgs *args) {
     // -------------------------------------------------------------------------
     // Stage 3: Forward weight packets root → each worker
     // -------------------------------------------------------------------------
+    // Root's NnProxyWeightLoader sends weights interleaved across workers:
+    //   For each op: [packet→w1][packet→w2]...[packet→wN]
+    // Then finish() sends [zero→w1][ack←proxy][zero→w2][ack←proxy]...[zero→wN][ack←proxy]
+    //
+    // The proxy must read one packet at a time, routing to the correct worker
+    // in round-robin order (w=0,1,...,nWorkers-1,0,1,...) until each worker
+    // receives its zero terminator and sends back an ACK.
     printf("💿 [Stage 3] Forwarding weights from root to %u worker(s)...\n", args->nWorkers);
-    for (NnUint w = 0; w < args->nWorkers; w++) {
-        NnSize totalFwd = 0;
-        NnUint nPkts = 0;
-        printf("💿 [Stage 3] Worker[%u] (%s:%u)...\n", w, args->workerHosts[w], args->workerPorts[w]);
-        while (true) {
+    {
+        std::vector<NnSize> totalFwd(args->nWorkers, 0);
+        std::vector<NnUint> nPkts(args->nWorkers, 0);
+        std::vector<bool> done(args->nWorkers, false);
+        NnUint nDone = 0;
+        NnUint w = 0; // current worker (round-robin)
+
+        while (nDone < args->nWorkers) {
+            // Skip already-finished workers
+            while (done[w]) w = (w + 1) % args->nWorkers;
+
             NnUint nameSize;
             readSocket(rootFd, &nameSize, sizeof(nameSize));
             workerNetwork->write(w, &nameSize, sizeof(nameSize));
-            if (nameSize == 0) { ackW2R(w); break; }
-            r2w(w, nameSize);
-            std::string opName((char *)buf.data(), nameSize - 1);
-            NnUint opIdx; readSocket(rootFd, &opIdx, sizeof(opIdx)); workerNetwork->write(w, &opIdx, sizeof(opIdx));
-            NnSize offset; readSocket(rootFd, &offset, sizeof(offset)); workerNetwork->write(w, &offset, sizeof(offset));
-            NnSize nBytes; readSocket(rootFd, &nBytes, sizeof(nBytes)); workerNetwork->write(w, &nBytes, sizeof(nBytes));
-            r2w(w, nBytes);
-            totalFwd += nBytes; nPkts++;
-            printf("💿 [Stage 3]   Worker[%u] op=%-22s idx=%3u offset=%8zu size=%8zu kB\n",
-                w, opName.c_str(), opIdx, (size_t)offset, nBytes / 1024);
+
+            if (nameSize == 0) {
+                // Zero terminator for this worker — read ACK from worker and forward to root
+                NnUint ack; workerNetwork->read(w, &ack, sizeof(ack));
+                writeSocket(rootFd, &ack, sizeof(ack));
+                printf("✅ [Stage 3] Worker[%u]: %u packets, %.2f MB forwarded\n",
+                    w, nPkts[w], totalFwd[w] / (1024.0f * 1024.0f));
+                done[w] = true;
+                nDone++;
+            } else {
+                r2w(w, nameSize);
+                std::string opName((char *)buf.data(), nameSize - 1);
+                NnUint opIdx; readSocket(rootFd, &opIdx, sizeof(opIdx)); workerNetwork->write(w, &opIdx, sizeof(opIdx));
+                NnSize offset; readSocket(rootFd, &offset, sizeof(offset)); workerNetwork->write(w, &offset, sizeof(offset));
+                NnSize nBytes; readSocket(rootFd, &nBytes, sizeof(nBytes)); workerNetwork->write(w, &nBytes, sizeof(nBytes));
+                r2w(w, nBytes);
+                totalFwd[w] += nBytes;
+                nPkts[w]++;
+                printf("💿 [Stage 3]   Worker[%u] op=%-22s idx=%3u offset=%8zu size=%8zu kB\n",
+                    w, opName.c_str(), opIdx, (size_t)offset, nBytes / 1024);
+            }
+            w = (w + 1) % args->nWorkers;
         }
-        printf("✅ [Stage 3] Worker[%u]: %u packets, %.2f MB forwarded (expected %.2f MB)\n",
-            w, nPkts, totalFwd / (1024.0f * 1024.0f),
-            workerInfos[w].weightBytes / (1024.0f * 1024.0f));
     }
     printf("✅ [Stage 3] All weights forwarded\n\n");
 
@@ -624,6 +646,13 @@ void runProxyApp(AppCliArgs *args) {
     //       each worker → proxy: sliceBytes * batchSize
     //       proxy → root: all worker slices (nWorkers * sliceBytes * batchSize)
 
+    // Enable non-blocking (turbo) mode now that weights are loaded.
+    // readMany/writeMany require non-blocking sockets to interleave I/O
+    // across all worker sockets concurrently and avoid deadlock during inference.
+    // Config and weight forwarding used blocking mode (sequential per-worker writes).
+    workerNetwork->setTurbo(true);
+    printf("🚁 Proxy worker sockets set to non-blocking mode\n\n");
+
     printf("🔀 [Stage 4/5] Entering inference relay loop...\n\n");
 
     // Build flat sync list from workerInfos[0] segments (same layout for all workers)
@@ -635,13 +664,10 @@ void runProxyApp(AppCliArgs *args) {
                 syncList.push_back(s);
     }
 
-    // Helper: get bytes per batch item for a pipe (full pipe size / batchSize is NOT right;
-    // pipeSize.x = dim per token, pipeSize.y = nBatches; we want bytes for one full pipe pass)
-    // pipeSizes[i].x = columns, pipeSizes[i].y = rows (nBatches), pipeSizes[i].floatType
-    // Total pipe bytes for batchSize tokens = batchSize * getBytes(floatType, x)
-    auto getPipeSliceBytes = [&](NnUint pipeIndex, NnUint batchSize) -> NnSize {
+    // Helper: get bytes for one token in a pipe
+    auto getPipeTokenBytes = [&](NnUint pipeIndex) -> NnSize {
         NnSize3D &ps = pipeSizes[pipeIndex];
-        return (NnSize)batchSize * getBytes(ps.floatType, ps.x);
+        return getBytes(ps.floatType, ps.x);
     };
 
     // Scratch buffer for sync relay
@@ -671,57 +697,87 @@ void runProxyApp(AppCliArgs *args) {
         NnUint batchSize = controlPacket.batchSize;
         NnSize rootToWorkers = 0, workersToRoot = 0;
 
-        // Handle each sync in the forward pass explicitly
+        // Handle each sync in the forward pass explicitly.
+        // CRITICAL: all sync operations must be processed PER BATCH ITEM to match
+        // NnNetworkNodeSynchronizer::sync() which loops over batchSize internally.
+        // If we batch all items at once, root deadlocks waiting for its read while
+        // the proxy is still waiting to read all batch items from root.
         for (auto &sync : syncList) {
-            NnSize pipeBytes = getPipeSliceBytes(sync.pipeIndex, batchSize);
-            NnSize sliceBytes = pipeBytes / netNNodes;
+            NnSize tokenBytes = getPipeTokenBytes(sync.pipeIndex);
+            NnSize sliceTokenBytes = tokenBytes / netNNodes;
 
-            if (sync.syncType == SYNC_WITH_ROOT) {
-                // root sends full pipe → proxy broadcasts to all workers
-                if (sliceBuf.size() < pipeBytes) sliceBuf.resize(pipeBytes);
-                readSocket(rootFd, sliceBuf.data(), pipeBytes);
-                workerNetwork->writeAll(sliceBuf.data(), pipeBytes);
-                rootToWorkers += pipeBytes;
+            for (NnUint batchIndex = 0; batchIndex < batchSize; batchIndex++) {
+                if (sync.syncType == SYNC_WITH_ROOT) {
+                    // Root sends full pipe token bytes → proxy broadcasts to all workers
+                    if (sliceBuf.size() < tokenBytes) sliceBuf.resize(tokenBytes);
+                    readSocket(rootFd, sliceBuf.data(), tokenBytes);
+                    workerNetwork->writeAll(sliceBuf.data(), tokenBytes);
+                    rootToWorkers += tokenBytes;
 
-            } else if (sync.syncType == SYNC_NODE_SLICES) {
-                // Collect root's slice
-                if (sliceBuf.size() < pipeBytes * netNNodes) sliceBuf.resize(pipeBytes * netNNodes);
-                // root slice is at index 0
-                readSocket(rootFd, sliceBuf.data(), sliceBytes);
-                rootToWorkers += sliceBytes;
+                } else if (sync.syncType == SYNC_NODE_SLICES) {
+                    // Collect all slices for this batch item, then distribute.
+                    // DEADLOCK PREVENTION: all workers call writeMany (send slice) then
+                    // readMany (recv other slices) simultaneously. We must read all worker
+                    // slices concurrently via readMany to avoid blocking on worker N while
+                    // worker N is blocked waiting for the proxy to send it other slices.
+                    NnSize totalBytes = sliceTokenBytes * netNNodes;
+                    if (sliceBuf.size() < totalBytes) sliceBuf.resize(totalBytes);
 
-                // Collect each worker's slice
-                for (NnUint w = 0; w < args->nWorkers; w++) {
-                    NnByte *workerSlice = sliceBuf.data() + (w + 1) * sliceBytes;
-                    workerNetwork->read(w, workerSlice, sliceBytes);
-                    workersToRoot += sliceBytes;
-                }
+                    // Read root's slice on root fd
+                    readSocket(rootFd, sliceBuf.data(), sliceTokenBytes);
+                    rootToWorkers += sliceTokenBytes;
 
-                // Send all worker slices to root
-                for (NnUint w = 0; w < args->nWorkers; w++) {
-                    NnByte *workerSlice = sliceBuf.data() + (w + 1) * sliceBytes;
-                    writeSocket(rootFd, workerSlice, sliceBytes);
-                }
-
-                // Send all nodes' slices to each worker (all except that worker's own)
-                for (NnUint w = 0; w < args->nWorkers; w++) {
-                    for (NnUint n = 0; n < netNNodes; n++) {
-                        if (n == w + 1) continue; // skip own slice
-                        NnByte *nodeSlice = sliceBuf.data() + n * sliceBytes;
-                        workerNetwork->write(w, nodeSlice, sliceBytes);
+                    // Read all worker slices concurrently via readMany
+                    {
+                        std::vector<NnSocketIo> ios(args->nWorkers);
+                        for (NnUint w = 0; w < args->nWorkers; w++) {
+                            ios[w].socketIndex = w;
+                            ios[w].data = sliceBuf.data() + (w + 1) * sliceTokenBytes;
+                            ios[w].size = sliceTokenBytes;
+                        }
+                        workerNetwork->readMany(args->nWorkers, ios.data());
+                        workersToRoot += sliceTokenBytes * args->nWorkers;
                     }
-                }
 
-            } else if (sync.syncType == SYNC_NODE_SLICES_EXCEPT_ROOT) {
-                // Collect each worker's slice
-                if (sliceBuf.size() < sliceBytes * args->nWorkers) sliceBuf.resize(sliceBytes * args->nWorkers);
-                for (NnUint w = 0; w < args->nWorkers; w++) {
-                    workerNetwork->read(w, sliceBuf.data() + w * sliceBytes, sliceBytes);
-                    workersToRoot += sliceBytes;
-                }
-                // Send all worker slices to root
-                for (NnUint w = 0; w < args->nWorkers; w++) {
-                    writeSocket(rootFd, sliceBuf.data() + w * sliceBytes, sliceBytes);
+                    // Send all worker slices to root
+                    for (NnUint n = 1; n < netNNodes; n++)
+                        writeSocket(rootFd, sliceBuf.data() + n * sliceTokenBytes, sliceTokenBytes);
+
+                    // Send each worker exactly 1 slice — the slice at its sliceIndex.
+                    // In isolated mode each worker has nSockets=1, socketIndex=0, nodeIndex=w+1:
+                    //   sliceIndex = socketIndex >= nodeIndex ? socketIndex+1 : socketIndex
+                    //              = 0 >= (w+1) ? 1 : 0 = 0 for all workers (all get root's slice)
+                    // This matches syncNodeSlices which reads exactly nSocketsPerThread=1 slice.
+                    {
+                        std::vector<NnSocketIo> ios(args->nWorkers);
+                        for (NnUint w = 0; w < args->nWorkers; w++) {
+                            NnUint nodeIndex = w + 1;
+                            NnUint sliceIndex = (0 >= nodeIndex) ? 1 : 0; // socketIndex=0
+                            ios[w].socketIndex = w;
+                            ios[w].data = sliceBuf.data() + sliceIndex * sliceTokenBytes;
+                            ios[w].size = sliceTokenBytes;
+                        }
+                        workerNetwork->writeMany(args->nWorkers, ios.data());
+                        rootToWorkers += sliceTokenBytes * args->nWorkers;
+                    }
+
+                } else if (sync.syncType == SYNC_NODE_SLICES_EXCEPT_ROOT) {
+                    // Each worker sends its slice → proxy forwards to root.
+                    // Read all worker slices concurrently via readMany to avoid deadlock.
+                    NnSize totalBytes = sliceTokenBytes * args->nWorkers;
+                    if (sliceBuf.size() < totalBytes) sliceBuf.resize(totalBytes);
+                    {
+                        std::vector<NnSocketIo> ios(args->nWorkers);
+                        for (NnUint w = 0; w < args->nWorkers; w++) {
+                            ios[w].socketIndex = w;
+                            ios[w].data = sliceBuf.data() + w * sliceTokenBytes;
+                            ios[w].size = sliceTokenBytes;
+                        }
+                        workerNetwork->readMany(args->nWorkers, ios.data());
+                        workersToRoot += sliceTokenBytes * args->nWorkers;
+                    }
+                    for (NnUint w = 0; w < args->nWorkers; w++)
+                        writeSocket(rootFd, sliceBuf.data() + w * sliceTokenBytes, sliceTokenBytes);
                 }
             }
         }
@@ -779,7 +835,10 @@ void runWorkerApp(AppCliArgs *args) {
                 if (inference.isFinished)
                     break;
 
-                if (args->netTurbo && !isTurboEnabled) {
+                // Do not enable turbo (non-blocking) in isolated/proxy mode (nSockets==1).
+                // In isolated mode the single socket connects back to the proxy which processes
+                // workers sequentially; non-blocking spin-loops cause livelock with 2+ workers.
+                if (args->netTurbo && !isTurboEnabled && network->nSockets > 1) {
                     network->setTurbo(true);
                     isTurboEnabled = true;
                     printf("🚁 Network is in non-blocking mode\n");

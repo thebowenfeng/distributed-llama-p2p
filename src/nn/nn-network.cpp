@@ -218,8 +218,6 @@ int createServerSocket(const char *host, const int port) {
 
     printf("Listening on %s:%d...\n", host, port);
 
-    setNoDelay(serverSocket);
-    setQuickAck(serverSocket);
     return serverSocket;
 }
 
@@ -296,14 +294,17 @@ std::unique_ptr<NnNetwork> NnNetwork::serve(const char *host, const int port) {
     NnSocket socketSocket(createServerSocket(host, port));
 
     NnUint nSockets;
+    NnUint nNodes;
     NnUint nodeIndex;
     int rootSocketFd = acceptSocket(socketSocket.fd);
     NnSocket rootSocket(rootSocketFd);
     printf("⭕ The root node has connected\n");
 
     readSocket(rootSocketFd, &nSockets, sizeof(nSockets));
-    NnUint nNodes = nSockets - 1; // nSockets - 1 root node
-    printf("⭕ nNodes: %d\n", nNodes);
+    // nNodes is sent separately after nSockets to support isolated (proxy) mode
+    // where nSockets=1 but nNodes=totalNodes for correct slice sizing
+    readSocket(rootSocketFd, &nNodes, sizeof(nNodes));
+    printf("⭕ nSockets: %d nNodes: %d\n", nSockets, nNodes);
     readSocket(rootSocketFd, &nodeIndex, sizeof(nodeIndex));
     printf("⭕ NodeIndex: %d\n", nodeIndex);
 
@@ -311,11 +312,12 @@ std::unique_ptr<NnNetwork> NnNetwork::serve(const char *host, const int port) {
     sockets[0].assign(rootSocket.release());
 
     printf("⭕ Socket[0]: accepted root node\n");
-    std::vector<std::unique_ptr<char[]>> hosts(nNodes);
-    std::vector<int> ports(nNodes);
+    NnUint nPeers = nSockets - 1; // number of peer workers to connect to
+    std::vector<std::unique_ptr<char[]>> hosts(nPeers);
+    std::vector<int> ports(nPeers);
 
     NnUint hostLen;
-    for (NnUint i = 0; i < nNodes; i++) {
+    for (NnUint i = 0; i < nPeers; i++) {
         readSocket(rootSocketFd, &hostLen, sizeof(hostLen));
 
         std::unique_ptr<char[]> host(new char[hostLen]);
@@ -330,7 +332,7 @@ std::unique_ptr<NnNetwork> NnNetwork::serve(const char *host, const int port) {
     // We need to wait here until the root node will send a "root is ready" packet
     readAckPacket(rootSocketFd);
 
-    for (NnUint i = 0; i < nNodes; i++) {
+    for (NnUint i = 0; i < nPeers; i++) {
         char *host = hosts[i].get();
         int port = ports[i];
         NnUint socketIndex = i + 1;
@@ -345,20 +347,57 @@ std::unique_ptr<NnNetwork> NnNetwork::serve(const char *host, const int port) {
         }
     }
 
+    // Store nNodes separately so syncNodeSlices uses correct logical count
+    std::unique_ptr<NnNetwork> net(new NnNetwork(&sockets));
+    net->nNodes = nNodes;
     printf("⭕ Network is initialized\n");
-    return std::unique_ptr<NnNetwork>(new NnNetwork(&sockets));
+    return net;
+}
+
+std::unique_ptr<NnNetwork> NnNetwork::connectIsolated(NnUint nSockets, char **hosts, NnUint *ports, NnUint totalNodes) {
+    // Connect to each worker sending nSockets=1 (only proxy socket) and
+    // nNodes=totalNodes (correct logical count for slice sizing).
+    // No peer addresses are sent, so workers never connect to each other.
+    // All slice traffic flows through socket[0] (proxy) on each worker.
+    NnUint workerNSockets = 1; // each worker only has one socket: back to proxy
+    std::vector<NnSocket> sockets(nSockets);
+    for (NnUint i = 0; i < nSockets; i++) {
+        printf("⭕ Socket[%d]: connecting to %s:%d worker (isolated)\n", i, hosts[i], ports[i]);
+        int fd = connectSocket(hosts[i], ports[i]);
+        sockets[i].assign(fd);
+        NnUint nodeIndex = i + 1; // 1-based: workers are nodes 1..N, root is node 0
+        writeSocket(fd, &workerNSockets, sizeof(workerNSockets)); // nSockets=1
+        writeSocket(fd, &totalNodes, sizeof(totalNodes));          // nNodes=totalNodes
+        writeSocket(fd, &nodeIndex, sizeof(nodeIndex));            // nodeIndex (1-based)
+        // nPeers = 0 — no peer addresses, so serve() reads 0 peer entries
+        readAckPacket(fd);
+        printf("⭕ Socket[%d]: connected (isolated)\n", i);
+    }
+    for (NnUint i = 0; i < nSockets; i++)
+        writeAckPacket(sockets[i].fd);
+    printf("⭕ Network is initialized (isolated mode, no worker peer connections)\n");
+    std::unique_ptr<NnNetwork> net(new NnNetwork(&sockets));
+    net->nNodes = totalNodes; // store logical nNodes for correct slice sizing
+    return net;
 }
 
 std::unique_ptr<NnNetwork> NnNetwork::connect(NnUint nSockets, char **hosts, NnUint *ports) {
     assert(nSockets > 0);
 
+    // nNodes seen by each worker = nSockets (workers) + 1 (root) = nSockets + 1
+    // But nSockets here is the number of worker sockets, so nNodes = nSockets + 1
+    // Each worker's serve() reads: nSockets_for_worker, nNodes, nodeIndex, peers
+    // nSockets_for_worker = nSockets (root + all other workers = total sockets worker has)
+    NnUint workerNSockets = nSockets; // worker socket count = nSockets (same as before)
+    NnUint nNodes = nSockets + 1;     // logical node count (root + all workers)
+
     std::vector<NnSocket> sockets(nSockets);
-    struct sockaddr_in addr;
     for (NnUint i = 0; i < nSockets; i++) {
         printf("⭕ Socket[%d]: connecting to %s:%d worker\n", i, hosts[i], ports[i]);
         int fd = connectSocket(hosts[i], ports[i]);
         sockets[i].assign(fd);
-        writeSocket(fd, &nSockets, sizeof(nSockets));
+        writeSocket(fd, &workerNSockets, sizeof(workerNSockets));
+        writeSocket(fd, &nNodes, sizeof(nNodes));
         writeSocket(fd, &i, sizeof(i)); // send node index
         for (NnUint j = 0; j < nSockets; j++) {
             if (j == i)
@@ -380,6 +419,7 @@ std::unique_ptr<NnNetwork> NnNetwork::connect(NnUint nSockets, char **hosts, NnU
 
 NnNetwork::NnNetwork(std::vector<NnSocket> *sockets) {
     this->nSockets = sockets->size();
+    this->nNodes = this->nSockets; // default: overridden in isolated (proxy) mode
     this->sockets = new int[nSockets];
     for (NnUint i = 0; i < nSockets; i++)
         this->sockets[i] = sockets->at(i).release();
@@ -731,21 +771,22 @@ void NnProxyNodeSynchronizer::sync(NnUint segmentIndex, NnUint nThreads, NnUint 
             NnByte *pipeBatch = &pipe[batchIndex * batchBytes];
 
             if (syncConfig->syncType == SYNC_WITH_ROOT) {
-                // Root sends its slice to proxy; proxy broadcasts to workers.
-                // Root then receives nothing (workers get it from proxy).
+                // Root sends full pipe to proxy; proxy broadcasts to all workers.
                 network->write(pipeBatch, batchBytes);
             } else if (syncConfig->syncType == SYNC_NODE_SLICES) {
-                // Root sends its slice, then receives all worker slices from proxy.
+                // Workers exchange slices peer-to-peer with each other directly.
+                // Root only exchanges its slice with proxy:
+                //   root → proxy: root's slice
+                //   proxy → root: each worker's slice (one per worker)
                 NnSize sliceBytes = batchBytes / network->nNodes;
                 NnByte *mySlice = &pipeBatch[0]; // root is node 0
                 network->write(mySlice, sliceBytes);
-                // Receive all other slices from proxy (proxy aggregated them)
                 for (NnUint n = 1; n < network->nNodes; n++) {
                     NnByte *sliceData = &pipeBatch[n * sliceBytes];
                     network->read(sliceData, sliceBytes);
                 }
             } else if (syncConfig->syncType == SYNC_NODE_SLICES_EXCEPT_ROOT) {
-                // Root only receives worker slices (doesn't send its own).
+                // Root only receives each worker's slice from proxy.
                 NnSize sliceBytes = batchBytes / network->nNodes;
                 for (NnUint n = 1; n < network->nNodes; n++) {
                     NnByte *sliceData = &pipeBatch[n * sliceBytes];

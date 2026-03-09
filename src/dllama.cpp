@@ -226,9 +226,9 @@ static void chat(AppInferenceContext *context) {
         context->inference->setBatchSize(1);
         context->tokenizer->resetDecoder();
 
-        printf("\n🤖 Assistant\n");
+        std::string response;
         if (inputPrompt.publicPrompt != nullptr)
-            printf("%s", inputPrompt.publicPrompt);
+            response += inputPrompt.publicPrompt;
 
         while (pos < seqLen) {
             context->inference->setPosition(pos);
@@ -241,15 +241,15 @@ static void chat(AppInferenceContext *context) {
             EosDetectorType eosType = eosDetector.append(token, piece);
             if (eosType == NOT_EOS || eosType == EOS) {
                 char *delta = eosDetector.getDelta();
-                if (delta != nullptr) {
-                    printf("%s", delta);
-                    fflush(stdout);
-                }
+                if (delta != nullptr)
+                    response += delta;
                 eosDetector.reset();
             }
             pos++;
             if (eosType == EOS) break;
         }
+
+        printf("\n🤖 Assistant\n%s\n", response.c_str());
 
         deltaItems.clear();
     } while (pos < seqLen);
