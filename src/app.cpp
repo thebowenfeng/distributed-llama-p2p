@@ -183,7 +183,7 @@ static std::vector<NnExecutorDevice> resolveDevices(AppCliArgs *args, NnNetConfi
     return devices;
 }
 
-RootLlmInference::RootLlmInference(LlmNet *net, NnNetExecution *execution, NnExecutor *executor, NnNetwork *network, NnProxyNetwork *proxyNetwork, std::vector<NnSize> nodeMatmulOpsPerToken) {
+RootLlmInference::RootLlmInference(LlmNet *net, NnNetExecution *execution, NnExecutor *executor, NnNetwork *network, NnProxyNetwork *proxyNetwork, std::vector<NnSize> nodeMatmulOpsPerToken, Tokenizer *tokenizer) {
     this->header = net->header;
     this->tokenPipe = (float *)execution->pipes[net->tokenPipeIndex];
     this->positionPipe = (float *)execution->pipes[net->positionPipeIndex];
@@ -193,6 +193,7 @@ RootLlmInference::RootLlmInference(LlmNet *net, NnNetExecution *execution, NnExe
     this->network = network;
     this->proxyNetwork = proxyNetwork;
     this->nodeMatmulOpsPerToken = nodeMatmulOpsPerToken;
+    this->tokenizer = tokenizer;
 }
 
 void RootLlmInference::setBatchSize(NnUint batchSize) {
@@ -217,8 +218,13 @@ void RootLlmInference::setToken(NnUint batchIndex, NnUint token) {
 void RootLlmInference::forward() {
     bool hasRemote = (network != nullptr || proxyNetwork != nullptr);
     if (hasRemote) {
-        printf("🔀 Distributing inference: position=%u batchSize=%u\n",
-            controlPacket.position, controlPacket.batchSize);
+        // Print the raw vocab string for the current input token directly from the
+        // vocab table (avoids the stateful decode() buffer which accumulates pieces).
+        NnUint token = (NnUint)tokenPipe[0];
+        const char *tokenStr = (token < tokenizer->vocabSize && tokenizer->vocab[token])
+            ? tokenizer->vocab[token] : "?";
+        printf("%s 🔀 Distributing inference: position=%u batchSize=%u\n",
+            tokenStr, controlPacket.position, controlPacket.batchSize);
         for (NnUint i = 0; i < (NnUint)nodeMatmulOpsPerToken.size(); i++)
             printf("   Node %u: %.3f GFLOPs\n", i, nodeMatmulOpsPerToken[i] * 2.0 * controlPacket.batchSize / 1e9);
         if (network != nullptr)
@@ -364,7 +370,7 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
         loadLlmNetWeight(args->modelPath, &net, &weightLoader);
     }
 
-    RootLlmInference inference(&net, &execution, &executor, network, proxyNetwork, nodeMatmulOpsPerToken);
+    RootLlmInference inference(&net, &execution, &executor, network, proxyNetwork, nodeMatmulOpsPerToken, &tokenizer);
 
     if (network != nullptr) {
         network->resetStats();
@@ -715,19 +721,25 @@ void runProxyApp(AppCliArgs *args) {
                     rootToWorkers += tokenBytes;
 
                 } else if (sync.syncType == SYNC_NODE_SLICES) {
-                    // Collect all slices for this batch item, then distribute.
-                    // DEADLOCK PREVENTION: all workers call writeMany (send slice) then
-                    // readMany (recv other slices) simultaneously. We must read all worker
-                    // slices concurrently via readMany to avoid blocking on worker N while
-                    // worker N is blocked waiting for the proxy to send it other slices.
+                    // All-gather: every node contributes its slice and receives all others.
+                    // In isolated/proxy mode each worker has nSockets=1 so the worker:
+                    //   1. Sends its own slice (buffer[nodeIndex * sliceBytes]) to the proxy.
+                    //   2. Reads nNodes-1 slices back, in ascending slice-index order
+                    //      skipping its own, placing each at buffer[sliceIndex * sliceBytes].
+                    //
+                    // Proxy protocol:
+                    //   root   → proxy : root's slice[0]              (sliceTokenBytes)
+                    //   worker → proxy : worker's slice[nodeIndex]    (sliceTokenBytes each)
+                    //   proxy  → root  : all worker slices[1..nNodes-1]
+                    //   proxy  → worker w : all slices except slice[w+1], in order
                     NnSize totalBytes = sliceTokenBytes * netNNodes;
                     if (sliceBuf.size() < totalBytes) sliceBuf.resize(totalBytes);
 
-                    // Read root's slice on root fd
+                    // Read root's slice
                     readSocket(rootFd, sliceBuf.data(), sliceTokenBytes);
                     rootToWorkers += sliceTokenBytes;
 
-                    // Read all worker slices concurrently via readMany
+                    // Read all worker slices concurrently to avoid deadlock
                     {
                         std::vector<NnSocketIo> ios(args->nWorkers);
                         for (NnUint w = 0; w < args->nWorkers; w++) {
@@ -743,22 +755,19 @@ void runProxyApp(AppCliArgs *args) {
                     for (NnUint n = 1; n < netNNodes; n++)
                         writeSocket(rootFd, sliceBuf.data() + n * sliceTokenBytes, sliceTokenBytes);
 
-                    // Send each worker exactly 1 slice — the slice at its sliceIndex.
-                    // In isolated mode each worker has nSockets=1, socketIndex=0, nodeIndex=w+1:
-                    //   sliceIndex = socketIndex >= nodeIndex ? socketIndex+1 : socketIndex
-                    //              = 0 >= (w+1) ? 1 : 0 = 0 for all workers (all get root's slice)
-                    // This matches syncNodeSlices which reads exactly nSocketsPerThread=1 slice.
-                    {
-                        std::vector<NnSocketIo> ios(args->nWorkers);
-                        for (NnUint w = 0; w < args->nWorkers; w++) {
-                            NnUint nodeIndex = w + 1;
-                            NnUint sliceIndex = (0 >= nodeIndex) ? 1 : 0; // socketIndex=0
-                            ios[w].socketIndex = w;
-                            ios[w].data = sliceBuf.data() + sliceIndex * sliceTokenBytes;
-                            ios[w].size = sliceTokenBytes;
+                    // Send all other slices to each worker sequentially, in ascending
+                    // slice-index order skipping the worker's own slice.
+                    // Worker w (nodeIndex = w+1) reads nNodes-1 slices from the proxy,
+                    // placing each at buffer[sliceIndex * sliceBytes] for sliceIndex != w+1.
+                    // The proxy sends them one by one to each worker (must be sequential
+                    // per worker since their sockets are non-blocking / readMany loops).
+                    for (NnUint w = 0; w < args->nWorkers; w++) {
+                        NnUint workerNodeIndex = w + 1;
+                        for (NnUint sliceIndex = 0; sliceIndex < netNNodes; sliceIndex++) {
+                            if (sliceIndex == workerNodeIndex) continue; // worker already has its own slice
+                            workerNetwork->write(w, sliceBuf.data() + sliceIndex * sliceTokenBytes, sliceTokenBytes);
+                            rootToWorkers += sliceTokenBytes;
                         }
-                        workerNetwork->writeMany(args->nWorkers, ios.data());
-                        rootToWorkers += sliceTokenBytes * args->nWorkers;
                     }
 
                 } else if (sync.syncType == SYNC_NODE_SLICES_EXCEPT_ROOT) {

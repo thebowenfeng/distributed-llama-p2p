@@ -66,8 +66,9 @@ private:
     NnProxyNetwork *proxyNetwork;
     LlmControlPacket controlPacket;
     std::vector<NnSize> nodeMatmulOpsPerToken;
+    Tokenizer *tokenizer;
 public:
-    RootLlmInference(LlmNet *net, NnNetExecution *execution, NnExecutor *executor, NnNetwork *network, NnProxyNetwork *proxyNetwork, std::vector<NnSize> nodeMatmulOpsPerToken);
+    RootLlmInference(LlmNet *net, NnNetExecution *execution, NnExecutor *executor, NnNetwork *network, NnProxyNetwork *proxyNetwork, std::vector<NnSize> nodeMatmulOpsPerToken, Tokenizer *tokenizer);
     void setBatchSize(NnUint batchSize);
     void setPosition(NnUint position);
     void setToken(NnUint batchIndex, NnUint token);

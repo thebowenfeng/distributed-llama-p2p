@@ -612,35 +612,58 @@ static void syncWithRoot(NnNetwork *network, NnByte nodeIndex, NnByte *buffer, N
 
 static void syncNodeSlices(bool onlyFromWorkerToRoot, NnNetwork *network, NnUint nodeIndex, NnUint nNodes, NnByte *buffer, NnSize nBytes, NnUint nThreads, NnUint threadIndex) {
     bool isWorker = nodeIndex != 0;
-    NnUint nSockets = onlyFromWorkerToRoot && isWorker ? 1 : network->nSockets;
-    NnUint nSocketsPerThread = nSockets / nThreads + (nSockets % nThreads > threadIndex ? 1 : 0);
-    if (nSocketsPerThread == 0) return;
     NnSize sliceBytes = nBytes / nNodes;
 
-    std::vector<NnSocketIo> ios(nSocketsPerThread);
-
     if (!onlyFromWorkerToRoot || isWorker) {
-        NnByte *mySliceData = &buffer[sliceBytes * nodeIndex];
-
-        for (NnUint i = 0; i < nSocketsPerThread; i++) {
-            NnUint socketIndex = threadIndex + i * nThreads;
-            ios[i].socketIndex = socketIndex;
-            ios[i].data = mySliceData;
-            ios[i].size = sliceBytes;
+        // Every node sends its own slice to all its sockets.
+        // In isolated (proxy) mode nSockets=1, so the worker sends to the proxy only.
+        NnUint nSockets = network->nSockets;
+        NnUint nSocketsPerThread = nSockets / nThreads + (nSockets % nThreads > threadIndex ? 1 : 0);
+        if (nSocketsPerThread > 0) {
+            std::vector<NnSocketIo> ios(nSocketsPerThread);
+            NnByte *mySliceData = &buffer[sliceBytes * nodeIndex];
+            for (NnUint i = 0; i < nSocketsPerThread; i++) {
+                NnUint socketIndex = threadIndex + i * nThreads;
+                ios[i].socketIndex = socketIndex;
+                ios[i].data = mySliceData;
+                ios[i].size = sliceBytes;
+            }
+            network->writeMany(nSocketsPerThread, &ios[0]);
         }
-        network->writeMany(nSocketsPerThread, &ios[0]);
     }
 
     if (!onlyFromWorkerToRoot || !isWorker) {
-        for (NnUint i = 0; i < nSocketsPerThread; i++) {
-            NnUint socketIndex = threadIndex + i * nThreads;
-            NnUint sliceIndex = socketIndex >= nodeIndex ? socketIndex + 1 : socketIndex;
-            NnByte *sliceData = &buffer[sliceBytes * sliceIndex];
-            ios[i].socketIndex = socketIndex;
-            ios[i].data = sliceData;
-            ios[i].size = sliceBytes;
+        if (network->nSockets == 1 && isWorker) {
+            // Isolated (proxy) mode: the single socket connects to the proxy.
+            // The proxy sends all nNodes-1 other slices sequentially (in ascending
+            // slice-index order, skipping our own slice).
+            // Only thread 0 does I/O; other threads are already excluded by the
+            // nSocketsPerThread==0 check that would normally gate this path.
+            if (threadIndex != 0) return;
+            NnSocketIo io;
+            io.socketIndex = 0;
+            for (NnUint sliceIndex = 0; sliceIndex < nNodes; sliceIndex++) {
+                if (sliceIndex == nodeIndex) continue; // skip own slice
+                io.data = &buffer[sliceBytes * sliceIndex];
+                io.size = sliceBytes;
+                network->readMany(1, &io);
+            }
+        } else {
+            // Direct (non-proxy) mode: each socket connects to a different peer.
+            // Socket i carries the slice of the peer at sliceIndex = (i >= nodeIndex) ? i+1 : i.
+            NnUint nSockets = network->nSockets;
+            NnUint nSocketsPerThread = nSockets / nThreads + (nSockets % nThreads > threadIndex ? 1 : 0);
+            if (nSocketsPerThread == 0) return;
+            std::vector<NnSocketIo> ios(nSocketsPerThread);
+            for (NnUint i = 0; i < nSocketsPerThread; i++) {
+                NnUint socketIndex = threadIndex + i * nThreads;
+                NnUint sliceIndex = socketIndex >= nodeIndex ? socketIndex + 1 : socketIndex;
+                ios[i].socketIndex = socketIndex;
+                ios[i].data = &buffer[sliceBytes * sliceIndex];
+                ios[i].size = sliceBytes;
+            }
+            network->readMany(nSocketsPerThread, &ios[0]);
         }
-        network->readMany(nSocketsPerThread, &ios[0]);
     }
 }
 
