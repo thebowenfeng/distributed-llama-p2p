@@ -52,27 +52,32 @@
       box-shadow: 0 2px 12px rgba(0,0,0,0.4);
     }
 
-    header .logo {
-      width: 36px;
-      height: 36px;
-      border-radius: 10px;
-      background: linear-gradient(135deg, var(--accent), #a78bfa);
+    .model-badge {
       display: flex;
       align-items: center;
-      justify-content: center;
-      font-size: 18px;
+      gap: 8px;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      padding: 5px 12px;
+      font-size: 0.78rem;
+      color: var(--text-muted);
+      white-space: nowrap;
+      overflow: hidden;
+      max-width: 340px;
+    }
+
+    .model-badge .model-label {
+      color: var(--text-muted);
       flex-shrink: 0;
     }
 
-    header h1 {
-      font-size: 1.1rem;
+    .model-badge .model-name {
+      color: #a78bfa;
+      font-family: 'Courier New', monospace;
       font-weight: 600;
-      color: var(--text);
-    }
-
-    header p {
-      font-size: 0.75rem;
-      color: var(--text-muted);
+      overflow: hidden;
+      text-overflow: ellipsis;
     }
 
     /* ── Config bar ── */
@@ -429,6 +434,14 @@
   </style>
 </head>
 <body>
+  <!-- Header -->
+  <header>
+    <div class="model-badge" id="model-badge">
+      <span class="model-label">Model:</span>
+      <span class="model-name" id="model-name">—</span>
+    </div>
+  </header>
+
   <!-- Config bar -->
   <div class="config-bar">
     <label>
@@ -437,7 +450,7 @@
     </label>
     <label>
       Gateway URL
-      <input type="text" id="gateway-url" value="http://localhost:8080" />
+      <input type="text" id="gateway-url" value="https://chat.123.243.95.71.sslip.io/api/gateway" />
     </label>
     <label>
       Max tokens
@@ -484,6 +497,49 @@
     const emptyState = document.getElementById('empty-state');
     const userInput  = document.getElementById('user-input');
     const sendBtn    = document.getElementById('send-btn');
+    const modelNameEl = document.getElementById('model-name');
+
+    // ── Model info ────────────────────────────────────────────────────────────
+    async function fetchModelInfo() {
+      const apiUrl = document.getElementById('api-url').value.trim();
+      if (!apiUrl) return;
+
+      // Derive base URL: strip path down to the root (scheme + host + port)
+      let baseUrl;
+      try {
+        const u = new URL(apiUrl);
+        baseUrl = u.origin;
+      } catch {
+        return;
+      }
+
+      try {
+        const res = await fetch(`${baseUrl}/v1/models`);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        // OpenAI-compatible: { data: [{ id, ... }] }
+        const modelId = data?.data?.[0]?.id ?? data?.id ?? null;
+        if (modelId) {
+          modelNameEl.textContent = modelId;
+          modelNameEl.title = modelId;
+        } else {
+          modelNameEl.textContent = '(unknown)';
+        }
+      } catch {
+        modelNameEl.textContent = 'unavailable';
+      }
+    }
+
+    // Re-fetch model info when API URL changes (with debounce)
+    let apiUrlDebounce;
+    document.getElementById('api-url').addEventListener('input', () => {
+      clearTimeout(apiUrlDebounce);
+      modelNameEl.textContent = '…';
+      apiUrlDebounce = setTimeout(fetchModelInfo, 600);
+    });
+
+    // Fetch on load
+    fetchModelInfo();
 
     // Conversation history sent to API on each request
     const history = [];

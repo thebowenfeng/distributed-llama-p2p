@@ -17,8 +17,21 @@ typedef SSIZE_T ssize_t;
 #include <vector>
 #include <fcntl.h>
 
+#ifdef _WIN32
+#define SOCKET_LAST_ERRCODE WSAGetLastError()
+static inline std::string socketLastErrorStr() {
+    int code = WSAGetLastError();
+    char msgBuf[256];
+    if (FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+                       nullptr, (DWORD)code, 0, msgBuf, sizeof(msgBuf), nullptr) == 0)
+        snprintf(msgBuf, sizeof(msgBuf), "WSA error %d", code);
+    return std::string(msgBuf);
+}
+#define SOCKET_LAST_ERROR socketLastErrorStr().c_str()
+#else
 #define SOCKET_LAST_ERRCODE errno
 #define SOCKET_LAST_ERROR strerror(errno)
+#endif
 
 #define ACK 23571114
 #define MAX_CHUNK_SIZE 4096
@@ -88,7 +101,7 @@ void writeSocket(int socket, const void *data, NnSize size) {
             if (isEagainError()) {
                 continue;
             }
-            throw NnTransferSocketException(0, "Error writing to socket");
+            throw NnTransferSocketException(SOCKET_LAST_ERRCODE, "Error writing to socket");
         } else if (s == 0) {
             throw NnTransferSocketException(0, "Socket closed");
         }
@@ -112,7 +125,7 @@ static inline bool tryReadSocket(int socket, void *data, NnSize size, unsigned l
                 }
                 continue;
             }
-            throw NnTransferSocketException(0, "Error reading from socket");
+            throw NnTransferSocketException(SOCKET_LAST_ERRCODE, "Error reading from socket");
         } else if (r == 0) {
             throw NnTransferSocketException(0, "Socket closed");
         }
